@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
-"""
-Claude Code usage limit watcher.
-Runs every minute via cron. Reads local CC cache first, falls back to API.
-Sends Telegram warning at 80% and 90%, schedules at-job for window-open notification.
-"""
+"""Watches Claude Code usage limits and schedules at-job for reset notification."""
 
 import json
 import os
 import subprocess
 import time
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone, timedelta
 
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+BOT_TOKEN = "8253128219:AAE5xCqXtoE9bnzSLlwAgRZCupGUswNLgYk"
+CHAT_ID = "8230181230"
 CREDS_FILE = os.path.expanduser("~/.claude/.credentials.json")
-CC_CACHE_FILE = os.path.expanduser("~/.claude/.usage-cache.json")
-API_CACHE_FILE = os.path.expanduser("~/.claude/.limit-notifier-api-cache.json")
-STATE_FILE = os.path.expanduser("~/.claude/.limit-notifier-state.json")
-OPEN_SCRIPT = os.path.expanduser("~/claude-limit-open.py")
-LOG_FILE = os.path.expanduser("~/.claude/.limit-notifier.log")
-
-CC_CACHE_MAX_AGE = 180   # trust statusline cache if fresher than 3 min
-API_CACHE_TTL = 300      # call live API at most once per 5 min
+CC_CACHE_FILE = os.path.expanduser("~/.claude/.usage-cache.json")  # written by statusline.sh
+API_CACHE_FILE = "/root/scripts/claude-limit-api-cache.json"       # our own cache
+API_CACHE_TTL = 300      # 5 minutes — prevents 429
+API_ATTEMPT_TTL = 270    # wait 4.5 min after any failed attempt before retrying
+CC_CACHE_MAX_AGE = 180   # 3 minutes — trust statusline cache if fresh
+API_ATTEMPT_FILE = "/root/scripts/claude-limit-last-attempt"
+STATE_FILE = "/root/scripts/claude-limit-notifier-state.json"
+OPEN_SCRIPT = "/root/scripts/claude-limit-open.py"
+LOG_FILE = "/root/scripts/claude-limit-notifier.log"
 
 
 def log(msg):
@@ -45,9 +43,10 @@ def send(text):
 
 
 def fetch_usage():
+    """Return usage data: use fresh CC cache → our API cache → live API call."""
     now = time.time()
 
-    # 1. Claude Code statusline cache (written every 2 min when CC is active)
+    # 1. statusline.sh cache (written when CC is active on this server)
     try:
         if now - os.path.getmtime(CC_CACHE_FILE) < CC_CACHE_MAX_AGE:
             with open(CC_CACHE_FILE) as f:
@@ -55,7 +54,7 @@ def fetch_usage():
     except Exception:
         pass
 
-    # 2. Our own API response cache (avoids rate-limiting)
+    # 2. Our own API cache (prevents 429 — max one real call per 5 min)
     try:
         if now - os.path.getmtime(API_CACHE_FILE) < API_CACHE_TTL:
             with open(API_CACHE_FILE) as f:
@@ -63,34 +62,42 @@ def fetch_usage():
     except Exception:
         pass
 
-    # 3. Live API call (with retry for transient DNS failures)
+    # 2b. Cooldown after a failed attempt (prevents 429 cascade on repeated DNS/auth errors)
+    try:
+        if now - os.path.getmtime(API_ATTEMPT_FILE) < API_ATTEMPT_TTL:
+            return None
+    except Exception:
+        pass
+
+    # 3. Live API call — stamp attempt time first so failure also triggers cooldown
+    try:
+        open(API_ATTEMPT_FILE, "w").close()
+    except Exception:
+        pass
+
     try:
         with open(CREDS_FILE) as f:
             token = json.load(f)["claudeAiOauth"]["accessToken"]
     except Exception:
         return None
 
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(
-                "https://api.anthropic.com/api/oauth/usage",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "anthropic-beta": "oauth-2025-04-20",
-                    "Accept": "application/json",
-                }
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-            with open(API_CACHE_FILE, "w") as f:
-                json.dump(data, f)
-            return data
-        except Exception as e:
-            log(f"fetch_usage attempt {attempt+1} failed: {e}")
-            if attempt < 2:
-                time.sleep(5)
-
-    return None
+    try:
+        req = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-beta": "oauth-2025-04-20",
+                "Accept": "application/json",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        with open(API_CACHE_FILE, "w") as f:
+            json.dump(data, f)
+        return data
+    except Exception as e:
+        log(f"fetch_usage failed: {e}")
+        return None
 
 
 def load_state():
@@ -116,6 +123,7 @@ def fmt_moscow(iso_str):
 
 
 def schedule_at(resets_at_str):
+    """Create one-time at job for the reset moment (server local time = UTC)."""
     dt = datetime.fromisoformat(resets_at_str.replace("Z", "+00:00"))
     local_dt = dt.astimezone()
     local_time = local_dt.strftime("%H:%M %Y-%m-%d")
@@ -146,13 +154,16 @@ def main():
 
         s = state.setdefault(key, {})
 
+        # Detect new window by minute (API milliseconds drift on each call)
         same_window = s.get("resets_at", "")[:16] == resets_at_str[:16]
         if not same_window:
             s.update({"warned_80": False, "warned_90": False, "at_scheduled": False})
+        # Always store latest resets_at (needed for at-job scheduling accuracy)
         s["resets_at"] = resets_at_str
 
+        # At 80%: schedule at-job + first warning (once)
         if util >= 80 and not s.get("at_scheduled"):
-            log(f"{key} hit {util}%, scheduling at-job")
+            log(f"{key} hit 80% (util={util}), scheduling at-job")
             ok = schedule_at(resets_at_str)
             s["at_scheduled"] = ok
             time_str = fmt_moscow(resets_at_str)
@@ -163,10 +174,11 @@ def main():
             )
             s["warned_80"] = True
 
+        # At 90%: second warning (once)
         if util >= 90 and not s.get("warned_90"):
             send(
                 f"🔴 <b>Claude Code {label}: 90% использовано</b>\n"
-                f"Осталось совсем немного."
+                f"Осталось совсем немного. Уведомление придёт когда окно откроется."
             )
             s["warned_90"] = True
 
