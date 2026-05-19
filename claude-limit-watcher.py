@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.request
@@ -16,11 +17,17 @@ CC_CACHE_FILE = os.path.expanduser("~/.claude/.usage-cache.json")  # written by 
 API_CACHE_FILE = "/root/scripts/claude-limit-api-cache.json"       # our own cache
 API_CACHE_TTL = 300      # 5 minutes — prevents 429
 API_ATTEMPT_TTL = 270    # wait 4.5 min after any failed attempt before retrying
+AUTH_FAIL_TTL = 3600     # 60 min cooldown after 401 — expired token won't help sooner
 CC_CACHE_MAX_AGE = 180   # 3 minutes — trust statusline cache if fresh
 API_ATTEMPT_FILE = "/root/scripts/claude-limit-last-attempt"
+AUTH_FAIL_FILE = "/root/scripts/claude-limit-auth-fail"
 STATE_FILE = "/root/scripts/claude-limit-notifier-state.json"
 OPEN_SCRIPT = "/root/scripts/claude-limit-open.py"
 LOG_FILE = "/root/scripts/claude-limit-notifier.log"
+
+# Tolerance for same-window detection: resets_at drifts a few seconds between API calls.
+# Use 30-minute window so drift never triggers a false "new window" reset.
+WINDOW_TOLERANCE_SEC = 1800
 
 
 def log(msg):
@@ -42,8 +49,22 @@ def send(text):
         log(f"send error: {e}")
 
 
+def parse_ts(iso_str):
+    return datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp()
+
+
+def same_reset_window(stored, new_str):
+    """True if stored and new resets_at refer to the same window (within tolerance)."""
+    if not stored:
+        return False
+    try:
+        return abs(parse_ts(stored) - parse_ts(new_str)) < WINDOW_TOLERANCE_SEC
+    except Exception:
+        return False
+
+
 def fetch_usage():
-    """Return usage data: use fresh CC cache → our API cache → live API call."""
+    """Return usage data: fresh CC cache → our API cache → live API call."""
     now = time.time()
 
     # 1. statusline.sh cache (written when CC is active on this server)
@@ -62,7 +83,14 @@ def fetch_usage():
     except Exception:
         pass
 
-    # 2b. Cooldown after a failed attempt (prevents 429 cascade on repeated DNS/auth errors)
+    # 2b. Long cooldown after 401 — expired token won't recover without user action
+    try:
+        if now - os.path.getmtime(AUTH_FAIL_FILE) < AUTH_FAIL_TTL:
+            return None
+    except Exception:
+        pass
+
+    # 2c. Short cooldown after any other failed attempt
     try:
         if now - os.path.getmtime(API_ATTEMPT_FILE) < API_ATTEMPT_TTL:
             return None
@@ -95,6 +123,19 @@ def fetch_usage():
         with open(API_CACHE_FILE, "w") as f:
             json.dump(data, f)
         return data
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            # Token expired — long cooldown, no point retrying every 5 min
+            try:
+                open(AUTH_FAIL_FILE, "w").close()
+            except Exception:
+                pass
+            log(f"fetch_usage failed: 401 Unauthorized (token expired, cooling down {AUTH_FAIL_TTL//60} min)")
+        elif e.code == 429:
+            log(f"fetch_usage failed: 429 Too Many Requests")
+        else:
+            log(f"fetch_usage failed: {e}")
+        return None
     except Exception as e:
         log(f"fetch_usage failed: {e}")
         return None
@@ -122,8 +163,28 @@ def fmt_moscow(iso_str):
     return f"{msk.strftime('%H:%M')} МСК{suffix}"
 
 
+def cancel_open_at_jobs():
+    """Cancel any pending at-jobs that run the open script."""
+    try:
+        result = subprocess.run("atq", capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            m = re.match(r"^\s*(\d+)", line)
+            if not m:
+                continue
+            job_id = m.group(1)
+            detail = subprocess.run(
+                f"at -c {job_id}", shell=True, capture_output=True, text=True
+            )
+            if OPEN_SCRIPT in detail.stdout:
+                subprocess.run(f"atrm {job_id}", shell=True, capture_output=True)
+                log(f"cancelled stale at-job {job_id}")
+    except Exception:
+        pass
+
+
 def schedule_at(resets_at_str):
     """Create one-time at job for the reset moment (server local time = UTC)."""
+    cancel_open_at_jobs()
     dt = datetime.fromisoformat(resets_at_str.replace("Z", "+00:00"))
     local_dt = dt.astimezone()
     local_time = local_dt.strftime("%H:%M %Y-%m-%d")
@@ -154,18 +215,15 @@ def main():
 
         s = state.setdefault(key, {})
 
-        # Detect new window by minute (API milliseconds drift on each call)
-        same_window = s.get("resets_at", "")[:16] == resets_at_str[:16]
-        if not same_window:
+        # Detect new window using timestamp tolerance (30 min) instead of string [:16].
+        # The API's resets_at drifts a few seconds per call — minute-level comparison
+        # caused false "new window" resets and duplicate notifications.
+        if not same_reset_window(s.get("resets_at", ""), resets_at_str):
             s.update({"warned_80": False, "warned_90": False, "at_scheduled": False})
-        # Always store latest resets_at (needed for at-job scheduling accuracy)
         s["resets_at"] = resets_at_str
 
-        # At 80%: schedule at-job + first warning (once)
-        if util >= 80 and not s.get("at_scheduled"):
-            log(f"{key} hit 80% (util={util}), scheduling at-job")
-            ok = schedule_at(resets_at_str)
-            s["at_scheduled"] = ok
+        # At 80%: send warning once, schedule at-job once (independently)
+        if util >= 80 and not s.get("warned_80"):
             time_str = fmt_moscow(resets_at_str)
             send(
                 f"⚠️ <b>Claude Code {label}: 80% использовано</b>\n"
@@ -174,7 +232,12 @@ def main():
             )
             s["warned_80"] = True
 
-        # At 90%: second warning (once)
+        if util >= 80 and not s.get("at_scheduled"):
+            log(f"{key} at 80%+ (util={util}), scheduling at-job")
+            ok = schedule_at(resets_at_str)
+            s["at_scheduled"] = ok
+
+        # At 90%: second warning once
         if util >= 90 and not s.get("warned_90"):
             send(
                 f"🔴 <b>Claude Code {label}: 90% использовано</b>\n"
